@@ -1,0 +1,27 @@
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# --- Решатели и вычисления ---
+*.lp
+*.mps
+*.log
+*.sol
+
+# --- Большие артефакты прогонов (хранить вне git) ---
+results/*.csv
+results/*.parquet
+results/*.npz
+
+# --- Архивные снимки (хранить вне git) ---
+archive/
+*.bundle
+
+# --- ОС ---
+.DS_Store
+Thumbs.db
