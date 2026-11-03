@@ -1,31 +1,43 @@
 """Сведённая MILP-модель размещения арендуемых каналов (infra-sharing).
 
 Вход:  instance.json (выход generate_instance.py).
-Выход: решение HiGHS + сводка по загрузкам; метаданные -> solution_nominal.json.
+Выход: решение HiGHS (через scipy) + сводка; метаданные -> solution_nominal.json.
 
-Модель (сведённая, по разделу 5 спецификации):
+Модель:
   Для каждой заявки d заранее построены k=2 маршрута-кандидата:
-    до ближайшего ЦОД и до альтернативного.
+    до целевого ЦОД (dst) и до одного альтернативного.
   Переменные:
     x_{d,p} in [0,1] — доля заявки d на маршруте p (сумма по p = 1);
     y_e in {0,1}     — арендуемый модуль ёмкости C на ребре e.
   Ограничения:
     (F1) sum_p x_{d,p} = 1                         для каждой заявки d;
     (F3) sum_{d,p: e in p} b_d * x_{d,p} <= C*y_e  для каждого ребра e.
-  Целевая (базовая семантика — номинальный режим):
-    min sum_e C*y_e — минимизация суммарной арендуемой ёмкости (Гбит).
-  Семантику сценариев отказа (1+1, переключения) сверяем после первого
-  прогона по контрольному числу из spec_core.txt.
+  Целевая (номинальный режим): min sum_e C*y_e.
 """
 
 import heapq
 import json
 from pathlib import Path
 
-import highspy
+import numpy as np
+import scipy.sparse as sp
+from scipy.optimize import Bounds, LinearConstraint, milp
 
-CAPACITY_C = 900.0   # Гбит, ёмкость арендуемого модуля
-K_CAND = 2           # число маршрутов-кандидатов на заявку
+CAPACITY_C_DEFAULT = 900.0   # Гбит, ёмкость арендуемого модуля (если нет в экземпляре)
+K_CAND = 2                   # число маршрутов-кандидатов на заявку
+
+STATUS_NAMES = {
+    0: "Optimal",
+    1: "Достигнут лимит времени/итераций",
+    2: "Infeasible (ограничения несовместны)",
+    3: "Unbounded",
+    4: "Прочее (решение не найдено)",
+}
+
+
+def _as_id(x):
+    """Возвращает идентификатор узла: и число, и словарь с ключом 'id'."""
+    return x if isinstance(x, int) else x["id"]
 
 
 def load_instance(path: Path) -> dict:
@@ -76,86 +88,104 @@ def k_shortest_paths(adj: dict, src: int, dst: int, k: int = K_CAND):
 
 
 def build_and_solve(inst: dict, out_dir: Path) -> dict:
-    n = inst["n_nodes"]
     edges = [tuple(e) for e in inst["edges"]]
     edge_idx = {tuple(sorted(e)): i for i, e in enumerate(edges)}
     demands = inst["demands"]
-    dcs = set(inst["datacenters"])
+    dcs = sorted({_as_id(x) for x in inst["dc_nodes"]})
+
+    # множество узлов: ЦОД + привязанные БС + всё, что встречается в рёбрах/заявках
+    nodes = set(dcs) | {_as_id(x) for x in inst["bound_bs_nodes"]}
+    for u, v in edges:
+        nodes.update((u, v))
+    for dm in demands:
+        nodes.add(dm["src"])
+        nodes.add(dm["dst"])
+    n = max(nodes) + 1
 
     adj = {u: [] for u in range(n)}
     for u, v in edges:
         adj[u].append(v)
         adj[v].append(u)
 
+    cap = float(inst.get("capacity_gbit", CAPACITY_C_DEFAULT))
+
     # маршруты-кандидаты: (индекс заявки, ширина, набор рёбер)
     cand = []
     for d_id, dm in enumerate(demands):
-        targets = [dm["dc_nearest"]] + [
-            dc for dc in sorted(dcs) if dc != dm["dc_nearest"]
-        ][:1]
+        primary = dm["dst"]  # ближайший ЦОД уже назначен генератором
+        targets = [primary] + [dc for dc in dcs if dc != primary][:1]
         for tgt in targets:
             for path in k_shortest_paths(adj, dm["src"], tgt):
                 es = [edge_idx[tuple(sorted((path[i], path[i + 1])))]
                       for i in range(len(path) - 1)]
-                cand.append((d_id, float(dm["b_gbit"]), es))
-
-    h = highspy.Highs()
-    h.setOptionValue("output_flag", False)
-    inf = highspy.kHighsInf
+                if es:
+                    cand.append((d_id, float(dm["gbits"]), es))
 
     nx, ny = len(cand), len(edges)
-    h.addVars(nx + ny, 0.0, 1.0)
+    n_demands = len(demands)
 
     # (F1): сумма по кандидатам заявки = 1
     by_demand = {}
     for j, (d_id, _, _) in enumerate(cand):
         by_demand.setdefault(d_id, []).append(j)
-    for d_id, js in by_demand.items():
-        h.addRow(1.0, 1.0, len(js),
-                 [highspy.HighsSparseMatrix.index_t(j) for j in js],
-                 [1.0] * len(js))
 
     # (F3): load_e - C*y_e <= 0
     by_edge = {}
     for j, (_, _, es) in enumerate(cand):
         for e in set(es):
             by_edge.setdefault(e, []).append(j)
-    for e in range(ny):
-        js = by_edge.get(e, [])
-        cols = js + [nx + e]
-        coefs = [cand[j][1] for j in js] + [-CAPACITY_C]
-        h.addRow(-inf, 0.0, len(cols),
-                 [highspy.HighsSparseMatrix.index_t(c) for c in cols], coefs)
 
-    # цель: min sum_e C*y_e
-    h.changeColsCost(
-        ny,
-        [highspy.HighsSparseMatrix.index_t(nx + e) for e in range(ny)],
-        [CAPACITY_C] * ny,
-    )
-    h.changeObjectiveSense(highspy.ObjSense.kMinimize)
-    h.run()
+    rows, cols, vals = [], [], []
+    for d_id, js in by_demand.items():
+        for j in js:
+            rows.append(d_id)
+            cols.append(j)
+            vals.append(1.0)
+    for e, js in by_edge.items():
+        for j in js:
+            rows.append(n_demands + e)
+            cols.append(j)
+            vals.append(cand[j][1])
+        rows.append(n_demands + e)
+        cols.append(nx + e)
+        vals.append(-cap)
 
-    status = h.getModelStatus()
-    col = list(h.getSolution().col_value)
+    A = sp.csr_matrix((vals, (rows, cols)), shape=(n_demands + ny, nx + ny))
+    lb = np.concatenate([np.ones(n_demands), np.full(ny, -np.inf)])
+    ub = np.concatenate([np.ones(n_demands), np.zeros(ny)])
+    constraints = LinearConstraint(A, lb, ub)
+
+    integrality = np.concatenate([np.zeros(nx), np.ones(ny)])  # x — непрерывные, y — целые
+    cost = np.concatenate([np.zeros(nx), np.full(ny, cap)])
+
+    res = milp(c=cost, constraints=constraints, integrality=integrality,
+               bounds=Bounds(np.zeros(nx + ny), np.ones(nx + ny)))
+
+    status = STATUS_NAMES.get(res.status, f"код {res.status}")
+    if res.x is None:
+        print(f"Статус: {status}")
+        print("[ERR] решения нет — пришлите этот вывод целиком")
+        return {"status": status}
+
+    col = list(res.x)
     y = col[nx:]
     used = [e for e in range(ny) if y[e] > 0.5]
     loads = {}
     for j, (d_id, b, es) in enumerate(cand):
-        if col[j] > 1e-6:
-            for e in set(es):
-                loads[e] = loads.get(e, 0.0) + b
+        for e in set(es):
+            loads[e] = loads.get(e, 0.0) + b * col[j]
 
-    total_cap = CAPACITY_C * len(used)
+
+    total_cap = cap * len(used)
     max_load = max(loads.values()) if loads else 0.0
-    print(f"Статус: {h.modelStatusToString(status)}")
+    print(f"Статус: {status}")
     print(f"Арендованных модулей: {len(used)} из {ny} рёбер")
     print(f"Суммарная арендуемая ёмкость: {total_cap:.1f} Гбит")
     print(f"Максимальная загрузка ребра: {max_load:.1f} Гбит "
-          f"({max_load / CAPACITY_C * 100:.1f}% от модуля)")
+          f"({max_load / cap * 100:.1f}% от модуля)")
 
     out = {
-        "status": h.modelStatusToString(status),
+        "status": status,
         "modules_used": len(used),
         "edges_used": [edges[e] for e in used],
         "total_capacity_gbit": total_cap,

@@ -34,10 +34,10 @@ def main() -> int:
     instance = build_instance()
     INSTANCE_PATH.write_text(json.dumps(instance, ensure_ascii=False, indent=2),
                              encoding="utf-8")
-    n_nodes = len(instance["nodes"])
+    n_nodes = len(instance["dc_nodes"]) + len(instance["bound_bs_nodes"])
     n_edges = len(instance["edges"])
     n_demands = len(instance["demands"])
-    total_load = sum(d["rate"] for d in instance["demands"])
+    total_load = sum(d["gbits"] for d in instance["demands"])
     print(f"[OK] экземпляр: узлов={n_nodes}, рёбер={n_edges}, заявок={n_demands}, "
           f"суммарная нагрузка={total_load}")
     print(f"[OK] сохранён {INSTANCE_PATH.name}")
@@ -49,21 +49,20 @@ def main() -> int:
         print("[ERR] не найден milp_reduced.py рядом с solve_core.py:", e)
         return 1
 
-    solution = build_and_solve(instance)
+    solution = build_and_solve(instance, out_dir=HERE)
     SOLUTION_PATH.write_text(json.dumps(solution, ensure_ascii=False, indent=2),
                              encoding="utf-8")
     print(f"[OK] сохранён {SOLUTION_PATH.name}")
 
-    # --- 3. Сводка ---
-    modules = solution.get("modules", {})
-    total_capacity = CAPACITY_MODULE * sum(modules.values())
+        # --- 3. Сводка ---
+    total_capacity = solution.get("total_capacity_gbit", 0.0)
     edge_loads = solution.get("edge_loads", {})
     max_load = max(edge_loads.values()) if edge_loads else 0.0
     max_edge = max(edge_loads, key=edge_loads.get) if edge_loads else "-"
-    print("---- сводка (номинальный сценарий) ----")
-    print(f"арендовано модулей: {sum(modules.values())} (по узлам: {modules})")
+    print("--- сводка (номинальный сценарий) ---")
+    print(f"арендовано модулей: {solution.get('modules_used', 0)}")
     print(f"суммарная арендуемая ёмкость: {total_capacity} Гбит")
-    print(f"максимальная загрузка ребра: {max_load} Гбит (ребро {max_edge})")
+    print(f"максимальная загрузка ребра: {max_load:.2f} Гбит (ребро {max_edge})")
     return 0
 
 
